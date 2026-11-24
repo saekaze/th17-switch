@@ -1,0 +1,390 @@
+diff --git a/ports/th17/portable/sdl/Renderer.cpp b/ports/th17/portable/sdl/Renderer.cpp
+index 0669a12..5fdac51 100644
+--- a/ports/th17/portable/sdl/Renderer.cpp
++++ b/ports/th17/portable/sdl/Renderer.cpp
+@@ -4,17 +4,20 @@
+ #endif
+ #include "Shaders.hpp"
+ #include "ResampleShader.hpp"
+-#include <emscripten.h>
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
+ #include <cstdio>
+ #include <cstdlib>
+ 
+-EM_JS(int, touhou_clip_control, (), {
+-  const e=GL.currentContext.GLctx.getExtension('EXT_clip_control');
+-  if(e)e.clipControlEXT(e.LOWER_LEFT_EXT,e.ZERO_TO_ONE_EXT);return !!e;
+-});
++// Switch port: EXT_clip_control through the GLES extension loader instead
++// of WebGL. Absent -> the shader keeps the [-1,1] depth remap.
++static int touhou_clip_control(){
++ const char* list=reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
++ if(!list||!std::strstr(list,"GL_EXT_clip_control"))return 0;
++ using ClipControl=void(*)(GLenum,GLenum);auto clip=reinterpret_cast<ClipControl>(SDL_GL_GetProcAddress("glClipControlEXT"));
++ if(!clip)return 0;clip(0x8CA1/*LOWER_LEFT*/,0x935F/*ZERO_TO_ONE*/);return glGetError()==GL_NO_ERROR;
++}
+ namespace touhou::sdl {
+ namespace {
+ Renderer* active=nullptr;
+@@ -44,12 +47,19 @@ Renderer* current(){return active;}void set_current(Renderer* r){active=r;}
+ State::State(){for(auto& m:matrix)m=identity;}
+ Renderer::Renderer(int v,Resolve r,void* p):version(v),resolve(r),owner(p){}
+ bool Renderer::initialize(){
+- if(!SDL_Init(SDL_INIT_VIDEO|SDL_INIT_EVENTS)){failure=SDL_GetError();return false;}
++ // Switch port: SDL2 window. Horizon gives one 1280x720 (handheld/docked)
++ // surface; desktop test builds open a resizable 960x720 window.
++ if(!SDL_InitSubSystem(SDL_INIT_VIDEO|SDL_INIT_EVENTS)){failure=SDL_GetError();return false;}
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK,SDL_GL_CONTEXT_PROFILE_ES);SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION,3);SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION,0);
++ SDL_GL_SetAttribute(SDL_GL_RED_SIZE,8);SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE,8);SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE,8);
+  SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE,0);SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,0);SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE,0);SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER,1);
+- window=SDL_CreateWindow(version==8?"Touhou 08":"Touhou 10",640,480,SDL_WINDOW_OPENGL);if(!window){failure=SDL_GetError();return false;}
+- SDL_SetWindowSize(window,640,480);
+- context=SDL_GL_CreateContext(window);if(!context){failure=SDL_GetError();return false;}SDL_GL_SetSwapInterval(1);drawState=DrawStateCache{};
++#ifdef __SWITCH__
++ window=th17compat::sdl2_window(title?title:"Touhou",SDL_WINDOWPOS_UNDEFINED,SDL_WINDOWPOS_UNDEFINED,1280,720,SDL_WINDOW_OPENGL|SDL_WINDOW_FULLSCREEN);
++#else
++ window=th17compat::sdl2_window(title?title:"Touhou",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,960,720,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
++#endif
++ if(!window){failure=SDL_GetError();return false;}
++ context=SDL_GL_CreateContext(window);if(!context){failure=SDL_GetError();return false;}SDL_GL_MakeCurrent(window,context);SDL_GL_SetSwapInterval(1);drawState=DrawStateCache{};
+  std::string source=vertexSource;if(version==10&&touhou_clip_control()){replace(source,"position.z*2.0-1.0","position.z");replace(source,"gl_Position.z=gl_Position.z*2.0-gl_Position.w;","");}
+  vertex=shader(GL_VERTEX_SHADER,source);glGenBuffers(1,&vertices.id);glGenBuffers(1,&indices.id);glGenBuffers(1,&instances.id);
+  glActiveTexture(GL_TEXTURE0);buildingGeneric=true;select(State{});generic=*program;programs.clear();buildingGeneric=false;
+@@ -71,7 +81,7 @@ Renderer::~Renderer(){discard();if(context){SDL_GL_MakeCurrent(window,context);f
+ #if TH_ENABLE_THPRAC
+  glDeleteProgram(imguiProgram);glDeleteVertexArrays(1,&imguiVao);glDeleteBuffers(1,&imguiVbo);glDeleteBuffers(1,&imguiEbo);glDeleteTextures(1,&imguiFontTexture);
+ #endif
+- SDL_GL_DestroyContext(context);}if(window)SDL_DestroyWindow(window);if(active==this)active=nullptr;SDL_Quit();}
++ SDL_GL_DestroyContext(context);}if(window)SDL_DestroyWindow(window);if(active==this)active=nullptr;}
+ void Renderer::bind_texture(GLuint id){if(boundTexture!=id){glBindTexture(GL_TEXTURE_2D,id);boundTexture=id;++stats.textureBinds;}}
+ void Renderer::bind_framebuffer(GLenum target,GLuint id){
+  const bool read=target!=GL_DRAW_FRAMEBUFFER,draw=target!=GL_READ_FRAMEBUFFER;
+@@ -295,14 +305,14 @@ void Renderer::drain(){
+  // Upload each contiguous drawing span once, then consume its original draw
+  // order and state. Target changes, clears, copies and CPU edits end a span.
+  // This retains full glBufferData replacement on WebGL (no bufferSubData).
+- upload(vertices,GL_ARRAY_BUFFER,vertexArena.data(),u32(vertexArena.size()),1048576);
++ drainVertexBase=upload(vertices,GL_ARRAY_BUFFER,vertexArena.data(),u32(vertexArena.size()),1048576);
+  const auto instanceBatches=std::count_if(queuedDraws.begin(),queuedDraws.end(),[](const QueuedDraw& q){return q.instanceSize!=0;});
+  // Large cancellation bursts alternate world sparks and trails. For those
+  // spans, replace the instance store once as well; small spans retain their
+  // fixed attribute offsets, which avoid unnecessary pointer setup.
+- const bool sharedInstances=instanceBatches>=16;if(sharedInstances)upload(instances,GL_ARRAY_BUFFER,instanceArena.data(),u32(instanceArena.size()),65536);
++ const bool sharedInstances=instanceBatches>=16;drainInstanceBase=sharedInstances?upload(instances,GL_ARRAY_BUFFER,instanceArena.data(),u32(instanceArena.size()),65536):0;
+  draining=true;
+- for(const auto& q:queuedDraws){drawOffset=q.offset;instanceOffset=sharedInstances?q.instanceOffset:~0u;issue(q.state,q.topology,q.count,nullptr,q.size,nullptr,IndexType::UInt16,q.instanceSize?instanceArena.data()+q.instanceOffset:nullptr,q.instanceSize,q.quads);}
++ for(const auto& q:queuedDraws){drawOffset=q.offset;instanceOffset=sharedInstances?drainInstanceBase+q.instanceOffset:~0u;issue(q.state,q.topology,q.count,nullptr,q.size,nullptr,IndexType::UInt16,q.instanceSize?instanceArena.data()+q.instanceOffset:nullptr,q.instanceSize,q.quads);}
+  draining=false;queuedDraws.clear();vertexArena.clear();instanceArena.clear();
+ }
+ void Renderer::discard(){batching=instancing=false;batchBytes.clear();worlds.clear();queuedDraws.clear();vertexArena.clear();instanceArena.clear();batchCount=0;}
+@@ -375,8 +385,14 @@ void Renderer::issue(const State& d,Topology primitive,u32 count,const void* dat
+  const std::array<u32,6> layoutKey{d.stride,u32(d.layout.screen),d.layout.diffuse,d.layout.specular,d.layout.uv,u32(!!instance)};
+  auto& layout=layouts[layoutKey];auto& vao=layout.vao;const bool setup=!vao;
+  if(setup)glGenVertexArrays(1,&vao);if(currentLayout!=vao){glBindVertexArray(vao);currentLayout=vao;}
+- const u32 base=draining?0:upload(vertices,GL_ARRAY_BUFFER,data,size,1048576);
++ const u32 base=draining?drainVertexBase:upload(vertices,GL_ARRAY_BUFFER,data,size,1048576);
++#ifdef __EMSCRIPTEN__
+  if(draining&&setup)bind_array_buffer(vertices.id);
++#else
++ // Native sets the pointers on every draw: they must address the vertex
++ // stream, not whichever buffer (e.g. instances) the last draw left bound.
++ if(draining)bind_array_buffer(vertices.id);
++#endif
+ #ifdef __EMSCRIPTEN__
+  if(setup){
+ #else
+@@ -503,16 +519,20 @@ void Renderer::read(u32 id){flush();auto it=surfaces.find(id);if(it==surfaces.en
+ }
+ void Renderer::release(u32 id){flush();for(auto& [depth,value]:depths)if(depth!=id&&std::any_of(value.pending.begin(),value.pending.end(),[&](const auto& c){return c.target==id;}))flush_depth(depth);auto d=depths.find(id);if(d!=depths.end()){glDeleteRenderbuffers(1,&d->second.buffer);depths.erase(d);}auto it=surfaces.find(id);if(it==surfaces.end())return;glDeleteTextures(1,&it->second.texture);glDeleteFramebuffers(1,&it->second.framebuffer);surfaces.erase(it);boundTexture=readFramebuffer=drawFramebuffer=~0u;}
+ void Renderer::present(u32 id){flush();pending=id;stats.frames++;if(!defer)commit();}
+-bool Renderer::commit(){if(!pending)return false;auto s=resolve(owner,pending);auto& g=surface(pending);pending=0;bind_framebuffer(GL_READ_FRAMEBUFFER,g.framebuffer);bind_framebuffer(GL_DRAW_FRAMEBUFFER,0);glDisable(GL_SCISSOR_TEST);int width=640,height=480;SDL_GetWindowSizeInPixels(window,&width,&height);glBlitFramebuffer(0,0,s.width*s.renderScale,s.height*s.renderScale,0,height,width,0,GL_COLOR_BUFFER_BIT,GL_NEAREST);SDL_GL_SwapWindow(window);stats.presentations++;return true;}
+-#include "ImguiRenderer.inc"
++bool Renderer::commit(){
++ if(!pending)return false;auto s=resolve(owner,pending);auto& g=surface(pending);pending=0;
++ // Switch port: aspect-correct upscale of the 4:3 frame, centred with pure
++ // black (#000000) bars - OLED friendly, same as the other ports.
++ int dw=0,dh=0;SDL_GL_GetDrawableSize(window,&dw,&dh);if(dw<=0||dh<=0){dw=640;dh=480;}
++ int pw=dw,ph=dw*3/4;if(ph>dh){ph=dh;pw=dh*4/3;}const int px=(dw-pw)/2,py=(dh-ph)/2;
++ picture={px,py,pw,ph,dw,dh};
++ bind_framebuffer(GL_DRAW_FRAMEBUFFER,0);glDisable(GL_SCISSOR_TEST);glColorMask(true,true,true,true);drawState.pipeline.colorMask=15;
++ glViewport(0,0,dw,dh);drawState.has_viewport=false;glClearColor(0,0,0,1);glClear(GL_COLOR_BUFFER_BIT);
++ bind_framebuffer(GL_READ_FRAMEBUFFER,g.framebuffer);
++ const u32 sw=s.width*s.renderScale,sh=s.height*s.renderScale;
++ glBlitFramebuffer(0,0,sw,sh,px,py+ph,px+pw,py,GL_COLOR_BUFFER_BIT,pw==int(sw)&&ph==int(sh)?GL_NEAREST:GL_LINEAR);
++ SDL_GL_SwapWindow(window);stats.presentations++;return true;
+ }
+-extern "C" {
+-const touhou::sdl::Statistics* sdl_stats(){static touhou::sdl::Statistics zero{};return touhou::sdl::current()?&touhou::sdl::current()->stats:&zero;}
+-void sdl_defer(int enabled){if(auto* r=touhou::sdl::current())r->defer=enabled;}
+-int sdl_commit(){return touhou::sdl::current()&&touhou::sdl::current()->commit();}
+-const char* sdl_error(){return touhou::sdl::current()?touhou::sdl::current()->error():SDL_GetError();}
+-int sdl_version(){return SDL_GetVersion();}
+-double sdl_ticks(){return double(SDL_GetTicksNS())/1000000.0;}
+-__attribute__((export_name("sdl_canvas"))) void sdl_canvas(const char* selector){SDL_SetHint(SDL_HINT_EMSCRIPTEN_CANVAS_SELECTOR,selector);}
+-__attribute__((export_name("sdl_pump"))) void sdl_pump(){SDL_Event event;while(SDL_PollEvent(&event)){};}
++#include "ImguiRenderer.inc"
+ }
++
+diff --git a/ports/th17/portable/sdl/Renderer.hpp b/ports/th17/portable/sdl/Renderer.hpp
+index 1e66573..2738d1c 100644
+--- a/ports/th17/portable/sdl/Renderer.hpp
++++ b/ports/th17/portable/sdl/Renderer.hpp
+@@ -49,6 +49,11 @@ public:
+     void render_imgui(const ImDrawData*,u32 target);
+ #endif
+     const char* error()const{return failure.c_str();}
++    const char* title=nullptr; // Switch port: window title
++    // Switch port: 4:3 picture rectangle inside the drawable (pillarboxed),
++    // updated on every present. Used to map touch input back to 640x480.
++    struct Picture {int x=0,y=0,width=640,height=480,drawable_width=640,drawable_height=480;} picture{};
++    SDL_Window* sdl_window()const{return window;}
+     int version;Resolve resolve;void* owner;
+ private:
+     struct GPU {GLuint texture=0,framebuffer=0;u32 version=~0u,dirtyBase=~0u,renderScale=1;std::array<u32,4> dirty{};bool rendered=false;GLuint attached=~0u;std::array<GLint,4> sampler{};};
+@@ -79,6 +84,9 @@ private:
+     std::vector<MergeGroup> mergeGroups;std::vector<size_t> mergeNext;
+     std::vector<QueuedDraw> orderedDraws;
+     bool draining=false;u32 drawOffset=0,instanceOffset=0;
++    // Native GLES sub-allocates the stream buffers (upload() returns a byte
++    // offset); WebGL replaces them, so these stay 0 there.
++    u32 drainVertexBase=0,drainInstanceBase=0;
+     void flush_batch();void drain();
+     GPU& surface(u32);GPU& target(u32,u32);void issue(const State&,Topology,u32,const void*,u32,const void*,IndexType,const void*,u32,bool quads=false);
+     void bind_texture(GLuint);void bind_framebuffer(GLenum,GLuint);void bind_array_buffer(GLuint);
+@@ -89,11 +97,3 @@ private:
+ Renderer* current();void set_current(Renderer*);
+ }
+ 
+-extern "C" {
+-__attribute__((export_name("sdl_stats"))) const touhou::sdl::Statistics* sdl_stats();
+-__attribute__((export_name("sdl_defer"))) void sdl_defer(int);
+-__attribute__((export_name("sdl_commit"))) int sdl_commit();
+-__attribute__((export_name("sdl_error"))) const char* sdl_error();
+-__attribute__((export_name("sdl_version"))) int sdl_version();
+-__attribute__((export_name("sdl_ticks"))) double sdl_ticks();
+-}
+diff --git a/ports/th17/portable/sdl/ResampleShader.hpp b/ports/th17/portable/sdl/ResampleShader.hpp
+index 07a2a07..1cb40b0 100644
+--- a/ports/th17/portable/sdl/ResampleShader.hpp
++++ b/ports/th17/portable/sdl/ResampleShader.hpp
+@@ -75,8 +75,8 @@ void main(){
+   }
+  }else{value=originalPixel(sourceRect.xy+at*sourceRect.zw/destinationRect.zw);}
+  uvec4 mask=uvec4(destinationMask);
+- uvec4 packed=uvec4(channel(value.r,mask.r),channel(value.g,mask.g),channel(value.b,mask.b),channel(value.a,mask.a));
+- outputColor=mix(vec4(1),vec4(packed)/max(vec4(mask),vec4(1)),greaterThan(mask,uvec4(0)));
++ uvec4 packedValue=uvec4(channel(value.r,mask.r),channel(value.g,mask.g),channel(value.b,mask.b),channel(value.a,mask.a));
++ outputColor=mix(vec4(1),vec4(packedValue)/max(vec4(mask),vec4(1)),greaterThan(mask,uvec4(0)));
+ }
+ )GLSL";
+ }
+diff --git a/ports/th17/web/cpp/game/AnmInterpreter.cpp b/ports/th17/web/cpp/game/AnmInterpreter.cpp
+index f2b63aa..38baa1e 100644
+--- a/ports/th17/web/cpp/game/AnmInterpreter.cpp
++++ b/ports/th17/web/cpp/game/AnmInterpreter.cpp
+@@ -10,7 +10,7 @@ bool integer_math(i32 a,i32 b,u32 operation,i32& out){
+ }
+ float float_math(float a,float b,u32 operation){switch(operation){case 0:return b;case 1:return float(a+b);case 2:return float(a-b);case 3:return float(a*b);case 4:return float(a/b);default:return float(std::fmod(double(a),double(b)));}}
+ }
+-bool AnmVm::bind(AnmScript& data){const i32 layer=visual.layer;const Vec3 translation=visual.translation;script=&data.bytes;resource=nullptr;source_script=-1;sprite=nullptr;sprite_resource=nullptr;sprite_source=nullptr;rotation_parent=nullptr;creation_parent=nullptr;slowdown=0;variables={};visual={};visual.layer=layer;visual.translation=translation;visual.sprite_matrix.identity();interpolators={};timer={};timer.set(0);age={};age.set(0);saved_timer={0,0,0,0,0};saved_offset=0;geometry.clear();instruction_offset=0;visible=false;pending_interrupt=0;error.clear();return script->size()>=8;}
++bool AnmVm::bind(AnmScript& data){const i32 layer=visual.layer;const Vec3 translation=visual.translation;script=&data.bytes;resource=nullptr;source_script=-1;sprite=nullptr;sprite_resource=nullptr;sprite_source=nullptr;rotation_parent=nullptr;creation_parent=nullptr;slowdown=0;variables={};visual=AnmVisualState{};visual.layer=layer;visual.translation=translation;visual.sprite_matrix.identity();interpolators={};timer={};timer.set(0);age={};age.set(0);saved_timer={0,0,0,0,0};saved_offset=0;geometry.clear();instruction_offset=0;visible=false;pending_interrupt=0;error.clear();return script->size()>=8;}
+ bool AnmVm::bind(AnmResource& data,u32 index){if(index>=data.scripts.size()||!bind(data.scripts[index]))return false;resource=&data;source_script=i32(index);return true;}
+ bool AnmVm::select_sprite(i32 index)noexcept{
+     AnmResource* source=resource;if(index<0){source=environment?environment->fallback_sprite_resource:nullptr;index=258;}
+diff --git a/ports/th17/web/cpp/sdl/Application.cpp b/ports/th17/web/cpp/sdl/Application.cpp
+index 64d61e6..71bb4b0 100644
+--- a/ports/th17/web/cpp/sdl/Application.cpp
++++ b/ports/th17/web/cpp/sdl/Application.cpp
+@@ -1,5 +1,7 @@
+ #include "ApplicationState.hpp"
+ #include "ThpracUi.hpp"
++#include "ArchivePrefetch.hpp"
++#include "Platform.hpp"
+ #include <SDL3/SDL.h>
+ #include <algorithm>
+ #include <ctime>
+@@ -33,7 +35,8 @@ bool ApplicationState::read(const std::string& requested,std::vector<u8>& bytes)
+    return true;
+   }
+  }
+- if(archive_file){const auto at=archive_names.find(name);if(at==archive_names.end()||!archive.read(at->second,bytes))return fail("Missing or invalid game archive entry: "+name);}
++ // Switch port: the next stage's files may already have been read on another core.
++ if(archive_file){if(!host::archive_prefetch().take(name,bytes)){const auto at=archive_names.find(name);if(at==archive_names.end()||!archive.read(at->second,bytes))return fail("Missing or invalid game archive entry: "+name);}}
+  else {size_t n=0;auto* data=static_cast<u8*>(SDL_LoadFile(("/assets/"+name).c_str(),&n));if(!data)return fail("Missing game asset: "+name);bytes.assign(data,data+n);SDL_free(data);}
+  if(bytes.size()<=1024*1024&&name.size()>=4&&name.substr(name.size()-4)!=".wav"&&name.substr(name.size()-4)!=".anm")resource_cache.emplace(name,bytes);return true;
+ }
+@@ -106,7 +109,7 @@ bool ApplicationState::release_game(){
+  close_options();fades.clear();display.reset();pause.reset();if(run_input&&flow.pending==AppScene::NextStage)retained_input=run_input->input;run_input.reset();if(!run)return true;
+  selection_player=scene()->battle.session;selection_score=scene()->battle.score;
+  if(flow.pending==AppScene::NextStage)return true;
+- run.reset();for(i32 bank:{0,6,8})animations.retire_resource(bank);animations.collect_resources();reset_graphics();if(!scene_effects&&!exiting)scene_effects=std::make_unique<AnmSceneEffects>(animations,environment.game_rng,visual,8);return true;
++ run.reset();host::archive_prefetch().clear();for(i32 bank:{0,6,8})animations.retire_resource(bank);animations.collect_resources();reset_graphics();if(!scene_effects&&!exiting)scene_effects=std::make_unique<AnmSceneEffects>(animations,environment.game_rng,visual,8);return true;
+ }
+ bool ApplicationState::begin_title(){
+  practice.active={};practice.menu=practice.confirmed=practice.cancelled=practice.accepted=false;
+@@ -190,6 +193,13 @@ bool ApplicationState::begin_game(bool playback){
+   if(!animations.interrupt(transition_overlay,1))return fail(animations.error);
+  }
+  performance.reset_result();progress.scoring.mode_flags&=~0xbu;scene()->battle.enemy_world.mode_flags=progress.scoring.mode_flags;
++ // Switch port: read the next stage's files (stNN*) ahead on another core
++ // while this stage plays; full games only (stages 1-5 lead to another).
++ if(archive_file&&(progress.scoring.mode_flags&0x30)==0&&progress.stage>=1&&progress.stage<6){
++  char prefix[8];std::snprintf(prefix,sizeof prefix,"st%02d",progress.stage+1);std::vector<std::string> names;
++  for(const auto& entry:archive_names)if(!entry.first.compare(0,4,prefix))names.push_back(entry.first);
++  host::archive_prefetch().start(host::paths().data_file("th17.dat"),std::move(names));
++ }
+ #if TH17_MULTIPLAYER
+  if(room_seats)++room_stage_generation;
+ #endif
+diff --git a/ports/th17/web/cpp/sdl/AudioDevice.cpp b/ports/th17/web/cpp/sdl/AudioDevice.cpp
+index b7f781c..d44e8c6 100644
+--- a/ports/th17/web/cpp/sdl/AudioDevice.cpp
++++ b/ports/th17/web/cpp/sdl/AudioDevice.cpp
+@@ -8,7 +8,11 @@
+ #define MINIAUDIO_IMPLEMENTATION
+ #include "../../../portable/sdl/third_party/miniaudio.h"
+ #include "AudioDevice.hpp"
++#include "BgmStream.hpp"
++#include "Platform.hpp"
+ #include <cmath>
++#include <cstdio>
++#include <cstring>
+ #include <eagler/audio/WebSfx.hpp>
+ namespace web_sfx = eagler::audio::web_sfx;
+ #include <algorithm>
+@@ -20,13 +24,15 @@ std::string wave_name(const std::string& value){return value.size()>=4&&value.co
+ }
+ struct AudioDevice::Impl final:MusicCommandOutput {
+  AudioDevice& owner;explicit Impl(AudioDevice& o):owner(o),commands(layout,*this){}
+- struct Voice {ma_decoder decoder{};ma_sound sound{};bool decoded=false,attached=false;~Voice(){web_sfx::erase(&sound);if(attached)ma_sound_uninit(&sound);if(decoded)ma_decoder_uninit(&decoder);}};
+- ma_engine engine{};SDL_AudioStream* stream=nullptr;bool engine_ready=false,ready=false,suspended=false,music_paused=false;
++ // Switch port: music voices stream PCM straight out of thbgm.dat (pcm)
++ // instead of decoding the web build's pre-converted OGG files.
++ struct Voice {ma_decoder decoder{};host::PcmStream pcm;ma_sound sound{};bool decoded=false,streamed=false,attached=false;~Voice(){web_sfx::erase(&sound);if(attached)ma_sound_uninit(&sound);if(decoded)ma_decoder_uninit(&decoder);if(streamed)ma_data_source_uninit(&pcm.base);}};
++ ma_engine engine{};SDL_AudioStream* stream=nullptr;host::BgmFile bgm;std::vector<char> bgm_buffer;bool engine_ready=false,ready=false,suspended=false,music_paused=false;
+  std::array<std::unique_ptr<Voice>,80> sounds;std::array<std::vector<u8>,69> samples;std::vector<std::unique_ptr<Voice>> music_cache;MusicLayout layout;MusicCommands commands;i32 selected_track=0,track=-1,fade=0,fade_total=0;bool command_ready=true;mutable u32 stats[11]{};
+- ~Impl(){music_cache.clear();for(auto& voice:sounds)voice.reset();if(stream)SDL_DestroyAudioStream(stream);if(engine_ready)ma_engine_uninit(&engine);}
++ ~Impl(){music_cache.clear();for(auto& voice:sounds)voice.reset();if(stream)SDL_DestroyAudioStream(stream);if(engine_ready)ma_engine_uninit(&engine);if(bgm.file)std::fclose(bgm.file);}
+  // TH17 never changes voice pitch. Decoders already produce the engine's
+  // sample rate; do not run a second per-voice resampler for every playing SE.
+- bool attach(Voice& v){if(ma_sound_init_from_data_source(&engine,&v.decoder,MA_SOUND_FLAG_NO_SPATIALIZATION|MA_SOUND_FLAG_NO_PITCH,nullptr,&v.sound)!=MA_SUCCESS)return false;v.attached=true;return true;}
++ bool attach(Voice& v){if(ma_sound_init_from_data_source(&engine,v.streamed?static_cast<ma_data_source*>(&v.pcm):static_cast<ma_data_source*>(&v.decoder),MA_SOUND_FLAG_NO_SPATIALIZATION|MA_SOUND_FLAG_NO_PITCH,nullptr,&v.sound)!=MA_SUCCESS)return false;v.attached=true;return true;}
+  Voice* voice(u32 id){return id<sounds.size()?sounds[id].get():nullptr;}Voice* current(){return track>=0&&u32(track)<music_cache.size()?music_cache[track].get():nullptr;}
+  bool music_ready()const override{return owner.music_enabled&&ready&&command_ready;}bool music_busy()const override{return false;}bool music_has_intro()const override{auto* t=layout.track(u32(selected_track));return t&&t->loop_start!=0;}
+  bool release_pending()const override{return false;}bool release_waiting()override{return false;}
+@@ -51,24 +57,38 @@ bool AudioDevice::initialize(AssetSource& resources,bool device){
+  if(ma_engine_init(&config,&a.engine)!=MA_SUCCESS){error="Unable to initialize audio mixer";return false;}a.engine_ready=true;
+  if(device){SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES,"2048");const SDL_AudioSpec spec{SDL_AUDIO_F32,2,44100};if(SDL_InitSubSystem(SDL_INIT_AUDIO))a.stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec,nullptr,nullptr);if(!a.stream){error=SDL_GetError();return false;}}
+  for(u32 n=0;n<a.samples.size();n++)if(!resources.read(sound_samples[n],a.samples[n])){error=std::string("Missing original sound: ")+sound_samples[n];return false;}
+- for(u32 id=0;id<a.sounds.size();id++){auto next=std::make_unique<Impl::Voice>();const auto& bytes=a.samples[effects.voices[id].definition->sample];auto decode=ma_decoder_config_init(ma_format_f32,2,44100);if(ma_decoder_init_memory(bytes.data(),bytes.size(),&decode,&next->decoder)!=MA_SUCCESS){error="Invalid TH17 WAV sample";return false;}next->decoded=true;if(!a.attach(*next)){error="Unable to attach sound voice";return false;}  if(device){ma_uint64 frames=0,read=0;if(ma_decoder_get_length_in_pcm_frames(&next->decoder,&frames)==MA_SUCCESS&&frames&&frames<=UINT32_MAX/8){std::vector<float> pcm(size_t(frames)*2);if(ma_decoder_read_pcm_frames(&next->decoder,pcm.data(),frames,&read)==MA_SUCCESS&&read==frames)web_sfx::upload(&next->sound,pcm.data(),unsigned(frames),2,44100);ma_decoder_seek_to_pcm_frame(&next->decoder,0);}}
++ for(u32 id=0;id<a.sounds.size();id++){auto next=std::make_unique<Impl::Voice>();const auto& bytes=a.samples[effects.voices[id].definition->sample];auto decode=ma_decoder_config_init(ma_format_f32,2,44100);if(ma_decoder_init_memory(bytes.data(),bytes.size(),&decode,&next->decoder)!=MA_SUCCESS){error="Invalid TH17 WAV sample";return false;}next->decoded=true;if(!a.attach(*next)){error="Unable to attach sound voice";return false;}
++#ifdef __EMSCRIPTEN__
++  if(device){ma_uint64 frames=0,read=0;if(ma_decoder_get_length_in_pcm_frames(&next->decoder,&frames)==MA_SUCCESS&&frames&&frames<=UINT32_MAX/8){std::vector<float> pcm(size_t(frames)*2);if(ma_decoder_read_pcm_frames(&next->decoder,pcm.data(),frames,&read)==MA_SUCCESS&&read==frames)web_sfx::upload(&next->sound,pcm.data(),unsigned(frames),2,44100);ma_decoder_seek_to_pcm_frame(&next->decoder,0);}}
++#endif
+  a.sounds[id]=std::move(next);}
+- std::vector<u8> format;if(!resources.read("thbgm.fmt",format)||!a.layout.open(format.data(),format.size())){error=a.layout.error.empty()?"Missing TH17 music layout":a.layout.error;return false;}a.music_cache.resize(a.layout.count());if(a.stream)SDL_ResumeAudioStreamDevice(a.stream);a.ready=true;error.clear();return true;
++ std::vector<u8> format;if(!resources.read("thbgm.fmt",format)||!a.layout.open(format.data(),format.size())){error=a.layout.error.empty()?"Missing TH17 music layout":a.layout.error;return false;}a.music_cache.resize(a.layout.count());
++ // Switch port: thbgm.dat is optional; without it the game runs silent, like the other ports.
++ a.bgm.file=std::fopen(host::paths().data_file("thbgm.dat").c_str(),"rb");
++ if(a.bgm.file){a.bgm_buffer.resize(64*1024);std::setvbuf(a.bgm.file,a.bgm_buffer.data(),_IOFBF,a.bgm_buffer.size());char magic[4]{};
++  if(std::fread(magic,1,4,a.bgm.file)!=4||std::memcmp(magic,"ZWAV",4)){host::log("thbgm.dat: not a ZWAV archive, music disabled");std::fclose(a.bgm.file);a.bgm.file=nullptr;}a.bgm.position=~0ull;}
++ else host::log("thbgm.dat not found, music disabled");
++ if(a.stream)SDL_ResumeAudioStreamDevice(a.stream);a.ready=true;error.clear();return true;
+ }
+ bool AudioDevice::prepare_music(const std::string& value){
+  if(!music_enabled)return true;
+- auto& a=*impl;if(!a.ready){error="Audio device not initialized";return false;}const i32 index=a.layout.original_index(wave_name(value));if(a.music_cache[index])return true;const auto& track=*a.layout.track(index);auto next=std::make_unique<Impl::Voice>();std::string filename=track.filename;filename.resize(filename.size()-4);const auto path=music_directory+"/"+filename+".ogg";auto config=ma_decoder_config_init(ma_format_f32,track.channels,track.rate);
+- if(ma_decoder_init_file(path.c_str(),&config,&next->decoder)!=MA_SUCCESS){error="Unable to decode "+path;return false;}next->decoded=true;ma_uint64 length=0;if(ma_decoder_get_length_in_pcm_frames(&next->decoder,&length)!=MA_SUCCESS||length!=track.frames()){error="Music PCM frame count differs from original: "+path;return false;}ma_data_source_set_loop_point_in_pcm_frames(&next->decoder,track.loop_frame(),track.frames());if(!a.attach(*next)){error="Unable to attach music voice";return false;}ma_sound_set_looping(&next->sound,MA_TRUE);a.music_cache[index]=std::move(next);return true;
++ auto& a=*impl;if(!a.ready){error="Audio device not initialized";return false;}const i32 index=a.layout.original_index(wave_name(value));if(a.music_cache[index]||!a.bgm.file)return true;const auto& track=*a.layout.track(index);auto next=std::make_unique<Impl::Voice>();
++ // The track plays up to its loop end, then loops back to the loop start.
++ auto& s=next->pcm;s.source=&a.bgm;s.offset=track.offset;s.frames=track.frames();s.channels=track.channels;s.rate=track.rate;
++ auto source=ma_data_source_config_init();source.vtable=&host::pcm_vtable;if(ma_data_source_init(&source,&s.base)!=MA_SUCCESS){error="Unable to open music stream";return false;}next->streamed=true;
++ ma_data_source_set_loop_point_in_pcm_frames(&s,track.loop_frame(),track.frames());if(!a.attach(*next)){error="Unable to attach music voice";return false;}ma_sound_set_looping(&next->sound,MA_TRUE);a.music_cache[index]=std::move(next);return true;
+ }
+ bool AudioDevice::music_file(const std::string& value){if(!prepare_music(value))return false;return music(impl->layout.original_index(wave_name(value)));}
+ bool AudioDevice::music(i32 index){
+  if(!music_enabled){stop_music();return true;}
+- auto& a=*impl;if(!a.ready)return false;if(index<0){stop_music();return true;}const auto* track=a.layout.track(u32(index));if(!track){error="Music index outside TH17 table";return false;}if(!prepare_music(track->filename))return false;if(auto* previous=a.current())ma_sound_stop(&previous->sound);a.track=a.selected_track=index;a.fade=a.fade_total=0;a.music_paused=false;auto* voice=a.current();ma_sound_seek_to_pcm_frame(&voice->sound,0);refresh_volume();ma_sound_start(&voice->sound);return true;
++ auto& a=*impl;if(!a.ready)return false;if(index<0){stop_music();return true;}const auto* track=a.layout.track(u32(index));if(!track){error="Music index outside TH17 table";return false;}if(!prepare_music(track->filename))return false;if(auto* previous=a.current())ma_sound_stop(&previous->sound);a.track=a.selected_track=index;a.fade=a.fade_total=0;a.music_paused=false;auto* voice=a.current();if(!voice)return true; // silent without thbgm.dat
++ ma_sound_seek_to_pcm_frame(&voice->sound,0);refresh_volume();ma_sound_start(&voice->sound);return true;
+ }
+ void AudioDevice::stop_music(){auto& a=*impl;if(auto* voice=a.current()){ma_sound_stop(&voice->sound);ma_sound_seek_to_pcm_frame(&voice->sound,0);}a.track=-1;a.fade=a.fade_total=0;a.music_paused=false;}
+ void AudioDevice::fade_music(i32 frames){auto& a=*impl;a.fade=a.fade_total=std::max(0,frames);if(!frames)if(auto* voice=a.current())ma_sound_stop(&voice->sound);}
+ void AudioDevice::pause_music(bool value){auto& a=*impl;auto* voice=a.current();if(!voice||a.music_paused==value)return;a.music_paused=value;if(value)ma_sound_stop(&voice->sound);else ma_sound_start(&voice->sound);}
+-bool AudioDevice::seek_music(double seconds){if(!music_enabled)return true;auto& a=*impl;auto* voice=a.current();const auto* track=a.layout.track(u32(a.track));if(!voice||!track||!std::isfinite(seconds)||seconds<0||seconds>double(UINT64_MAX)/track->rate){error="Invalid music seek";return false;}u64 frame=u64(seconds*track->rate);if(frame>=track->frames())frame=track->loop_frame()+(frame-track->loop_frame())%(track->frames()-track->loop_frame());return ma_sound_seek_to_pcm_frame(&voice->sound,frame)==MA_SUCCESS;}
++bool AudioDevice::seek_music(double seconds){if(!music_enabled)return true;auto& a=*impl;auto* voice=a.current();if(!voice&&!a.bgm.file)return true; // silent without thbgm.dat
++ const auto* track=a.layout.track(u32(a.track));if(!voice||!track||!std::isfinite(seconds)||seconds<0||seconds>double(UINT64_MAX)/track->rate){error="Invalid music seek";return false;}u64 frame=u64(seconds*track->rate);if(frame>=track->frames())frame=track->loop_frame()+(frame-track->loop_frame())%(track->frames()-track->loop_frame());return ma_sound_seek_to_pcm_frame(&voice->sound,frame)==MA_SUCCESS;}
+ bool AudioDevice::current_music(std::string& wave,double& seconds){auto& a=*impl;auto* voice=a.current();const auto* track=a.layout.track(u32(a.track));if(!voice||!track){wave.clear();seconds=0;return true;}ma_uint64 cursor=0;if(ma_sound_get_cursor_in_pcm_frames(&voice->sound,&cursor)!=MA_SUCCESS)return false;wave=track->filename;seconds=double(cursor)/track->rate;return true;}
+ void AudioDevice::refresh_volume(){auto& a=*impl;if(auto* voice=a.current()){const i32 base=a.fade_total?i32(i64(a.fade)*5000/a.fade_total)-5000:0;ma_sound_set_volume(&voice->sound,music_enabled?amplitude(adjusted_music_volume(base,music_volume)):0.f);}}
+ bool AudioDevice::queue_music(i32 code,i32 value,const std::string& text){if(!impl->commands.enqueue(code,value,text)){error=impl->commands.error;return false;}return true;}
+diff --git a/ports/th17/web/cpp/sdl/FileStore.cpp b/ports/th17/web/cpp/sdl/FileStore.cpp
+index cc11b3f..4e3accf 100644
+--- a/ports/th17/web/cpp/sdl/FileStore.cpp
++++ b/ports/th17/web/cpp/sdl/FileStore.cpp
+@@ -12,7 +12,10 @@ bool FileStore::read(const std::string& path,std::vector<u8>& bytes,u32 limit,bo
+  if(size<0||u64(size)>limit){SDL_CloseIO(file);error="Player file outside allowed size: "+path;return false;}bytes.resize(size_t(size));const bool ok=SDL_ReadIO(file,bytes.data(),bytes.size())==bytes.size(),closed=SDL_CloseIO(file);if(!ok||!closed){error="Unable to finish reading player file: "+path;return false;}return true;
+ }
+ bool FileStore::write(const std::string& path,const u8* bytes,u32 size){
+- const auto temporary=path+".tmp";SDL_IOStream* file=SDL_IOFromFile(temporary.c_str(),"wb");if(!file){error="Unable to create player file: "+path;return false;}const bool written=SDL_WriteIO(file,bytes,size)==size,closed=SDL_CloseIO(file);if(!written||!closed||std::rename(temporary.c_str(),path.c_str())!=0){error="Unable to finish player file: "+path;return false;}return true;
++ const auto temporary=path+".tmp";SDL_IOStream* file=SDL_IOFromFile(temporary.c_str(),"wb");if(!file){error="Unable to create player file: "+path;return false;}const bool written=SDL_WriteIO(file,bytes,size)==size,closed=SDL_CloseIO(file);
++ // Switch port: FAT (sdmc) rename does not replace an existing file.
++ if(written&&closed)std::remove(path.c_str());
++ if(!written||!closed||std::rename(temporary.c_str(),path.c_str())!=0){error="Unable to finish player file: "+path;return false;}return true;
+ }
+ bool FileStore::initialize(RecordStore& records,GameConfig& config,Rng& random){
+  if(!directory_exists(directory)&&::mkdir(directory.c_str(),0777)!=0){error="Unable to create save directory";return false;}const auto replays=directory+"/replay";if(!directory_exists(replays)&&::mkdir(replays.c_str(),0777)!=0){error="Unable to create replay directory";return false;}
+diff --git a/ports/th17/web/cpp/sdl/FileStore.hpp b/ports/th17/web/cpp/sdl/FileStore.hpp
+index 9c4aff0..386e68c 100644
+--- a/ports/th17/web/cpp/sdl/FileStore.hpp
++++ b/ports/th17/web/cpp/sdl/FileStore.hpp
+@@ -3,12 +3,13 @@
+ #include "../game/RecordStore.hpp"
+ #include "../game/ReplayCatalog.hpp"
+ #include "../game/ReplayRecording.hpp"
++#include "th17_native.h"
+ namespace th17::sdl {
+ class FileStore {
+  std::string directory;std::vector<u8> saved_score,saved_config;
+  bool read(const std::string&,std::vector<u8>&,u32,bool&);bool write(const std::string&,const u8*,u32);static bool filename(const std::string&)noexcept;
+ public:
+- std::string error;explicit FileStore(std::string root="/save"):directory(std::move(root)){}
++ std::string error;explicit FileStore(std::string root=th17native::save_directory()):directory(std::move(root)){}
+  bool initialize(RecordStore&,GameConfig&,Rng&);bool save(RecordStore&,const GameConfig&);
+  bool replay(const std::string&,std::shared_ptr<Replay>&);bool replay_slot(i32,std::shared_ptr<Replay>&);
+  bool save_replay(i32,ReplayRecording&,const std::array<char,9>&,const ReplayExportDetails&);bool catalog(ReplayCatalog&);
+diff --git a/ports/th17/web/cpp/sdl/FontDevice.cpp b/ports/th17/web/cpp/sdl/FontDevice.cpp
+index 6b1db92..1e1a604 100644
+--- a/ports/th17/web/cpp/sdl/FontDevice.cpp
++++ b/ports/th17/web/cpp/sdl/FontDevice.cpp
+@@ -5,8 +5,10 @@
+ namespace th17::sdl {
+ bool FontDevice::initialize(){
+  if(!original_ready){
+-  size_t size=0;auto* mapping=static_cast<u8*>(SDL_LoadFile("/fonts/cp932.bin",&size));
+-  const bool valid=original_font.initialize(mapping,size);SDL_free(mapping);
++  // Switch port: the CP932 table is built into the program (same layout as
++  // the web build's fonts/cp932.bin).
++  size_t size=0;const auto* mapping=th17native::cp932_table(&size);
++  const bool valid=original_font.initialize(mapping,size);
+   if(!valid){error="Shared MS Gothic font or CP932 mapping unavailable";return false;}
+   raster.glyphs.renderer(&original_font,[](void* owner,TextureImage& image,i32 x,i32 y,u32 font,u32 color,const std::string& text){
+       return static_cast<eagler::text::RuntimeFontRaster*>(owner)->draw(image,x,y,font,color,text);
+diff --git a/ports/th17/web/cpp/sdl/GraphicsDevice.cpp b/ports/th17/web/cpp/sdl/GraphicsDevice.cpp
+index 55362ba..b25aff6 100644
+--- a/ports/th17/web/cpp/sdl/GraphicsDevice.cpp
++++ b/ports/th17/web/cpp/sdl/GraphicsDevice.cpp
+@@ -10,8 +10,10 @@ bool GraphicsDevice::initialize(){
+     backend.additive_batches=true;
+     backend.lazy_depth_clears=true;
+     for(u32 id:{screen,depth}){textures[id].renderScale=render_scale;auto& image=textures[id].image;image.width=640;image.height=480;image.pitch=640*(id==screen?4:2);image.format=id==screen?PixelFormat::Bgra8:PixelFormat::Depth16;if(id==screen)image.pixels.resize(image.pitch*image.height);}
+-    SDL_SetHint(SDL_HINT_EMSCRIPTEN_KEYBOARD_ELEMENT,"#canvas");
+-    if(!backend.initialize()){error=backend.error();return false;}SDL_SetWindowTitle(SDL_GL_GetCurrentWindow(),"Touhou 17");SDL_SetWindowSize(SDL_GL_GetCurrentWindow(),640*render_scale,480*render_scale);backend.state.target=screen;backend.state.depth=depth;configure_game(1);return true;
++    // Switch port: the renderer opens the native window itself (fullscreen
++    // 1280x720 on Switch) and letterboxes the 640x480 frame on present.
++    backend.title="Touhou 17: Wily Beast and Weakest Creature";
++    if(!backend.initialize()){error=backend.error();return false;}backend.state.target=screen;backend.state.depth=depth;configure_game(1);return true;
+ }
+ bool GraphicsDevice::preload(AnmResource& file,bool low_color,const AnmResource* detailed,bool room_front){
+     if(resources.find(&file)!=resources.end())return true;

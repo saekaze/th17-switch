@@ -1,0 +1,22 @@
+# upstream sources are fetched at build time, never committed
+upstream/
+# build trees and products
+build/
+build-switch/
+*.nro
+*.nro.sha256
+*.nacp
+*.elf
+# game data must never be committed
+th17.dat
+thbgm.dat
+msgothic.ttc
+msgothic.ttf
+save/
+*.ppm
+# saves, replays, snapshots and logs written by test runs
+th17.cfg
+scoreth17.dat
+replay/
+snapshot/
+*.log

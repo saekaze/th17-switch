@@ -1,0 +1,80 @@
+name: Build Switch NRO
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a release with this tag (e.g. v1.00b-r2); empty = just build"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install host build tools
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq cmake ninja-build git python3
+
+      # SDL2_ttf draws the game's text; make sure it (and its FreeType and
+      # HarfBuzz) are in the image's portlibs.
+      - name: Install Switch libraries
+        run: |
+          PM=$(command -v dkp-pacman || command -v pacman)
+          "$PM" -Sy --noconfirm --needed switch-sdl2 switch-sdl2_ttf switch-freetype switch-harfbuzz switch-mesa switch-libdrm_nouveau
+          ls /opt/devkitpro/portlibs/switch/lib/libSDL2_ttf.a
+
+      # The TH17 runtime is downloaded at the commit in UPSTREAM_COMMIT and
+      # patches/native.patch is applied on top.
+      - name: Fetch upstream sources
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/fetch_upstream.sh
+
+      - name: Build
+        env:
+          DEVKITPRO: /opt/devkitpro
+        run: ./scripts/build_switch.sh
+
+      - name: Show result
+        run: ls -lh build-switch/touhou17.nro
+
+      - name: Upload NRO
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: touhou17-switch
+          path: build-switch/touhou17.nro
+          if-no-files-found: error
+
+      # Tags and release_tag runs also publish the NRO as a release asset.
+      - name: Checksum
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
+        run: |
+          cd build-switch
+          sha256sum touhou17.nro > touhou17.nro.sha256
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/') || inputs.release_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          files: |
+            build-switch/touhou17.nro
+            build-switch/touhou17.nro.sha256
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
