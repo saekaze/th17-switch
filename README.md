@@ -126,7 +126,7 @@ The Linux build can play itself for testing: `TH17_SCRIPT` (a file of `frame mas
 ## 🤝 Credits & Acknowledgments
 
 * **ZUN / Team Shanghai Alice** — original creator and developer of the Touhou Project series.
-* **[eagler-touhou](https://github.com/Ritosa2333/eagler-touhou)** (Ritosa2333 and contributors) — the TH17 C++ runtime this port is built on.
+* **[Ritosa2333](https://github.com/Ritosa2333/eagler-touhou)** — the TH17 C++ runtime (eagler-touhou, MIT) this port is built on.
 * **Switchbrew & devkitPro Team** — the open-source `libnx` SDK and Switch toolchain.
 
-**Licensing:** the Switch port code in this repository (`src/`, `compat/`, `scripts/`, build files) is CC0 1.0 (see `LICENSE`). The TH17 runtime is not part of this repository; it is downloaded from eagler-touhou at build time and stays under its authors' terms, as do the third-party libraries it bundles (see `ports/th17/THIRD-PARTY-NOTICES.txt` in the fetched sources).
+**Licensing:** the Switch port code in this repository (`src/`, `compat/`, `scripts/`, build files) is CC0 1.0 (see `LICENSE`). The TH17 runtime is downloaded from eagler-touhou at build time and is Ritosa2333's code under the **MIT** licence ([confirmed by the author](https://github.com/Ritosa2333/th10/issues/3)), as is what `patches/native.patch` changes in it (see [`LICENSE-Ritosa2333.txt`](LICENSE-Ritosa2333.txt)). The third-party libraries it bundles keep their own licences (see `ports/th17/THIRD-PARTY-NOTICES.txt` in the fetched sources).
